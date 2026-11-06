@@ -8,6 +8,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:vector_math/vector_math_64.dart' as vector;
 import 'package:camera/camera.dart';
 import 'package:image_picker/image_picker.dart';
+import '../utils/storage_error_message.dart';
 
 // dart:io is mobile-only — import conditionally so the web build doesn't break
 import 'package:flutter/foundation.dart';
@@ -36,9 +37,14 @@ class _AdvancedVehicleCaptureScreenState
   List<CameraDescription>? _cameras;
   bool _isCameraInitialized = false;
   bool _cameraFailed = false; // track whether camera actually failed
+  String? _cameraFailureReason;
   bool _isProcessing = false;
   bool _showGuidance = true;
   double _captureProgress = 0.0;
+  double _uploadProgress = 0.0;
+  Uint8List? _pendingPhotoBytes;
+  String? _pendingPhotoContentType;
+  String? _pendingStoragePath;
 
   Map<String, String> _capturedPhotos = {};
 
@@ -147,6 +153,13 @@ class _AdvancedVehicleCaptureScreenState
 
   Future<void> _initializeCamera() async {
     try {
+      final previousController = _cameraController;
+      _cameraController = null;
+      if (previousController != null) {
+        await previousController.dispose();
+      }
+      if (!mounted) return;
+
       _cameras = await availableCameras();
 
       if (_cameras == null || _cameras!.isEmpty) {
@@ -173,18 +186,23 @@ class _AdvancedVehicleCaptureScreenState
 
       await _cameraController!.initialize();
 
-      if (mounted) {
-        setState(() {
-          _isCameraInitialized = true;
-          _cameraFailed = false;
-        });
-        try {
-          await _cameraController!.setFlashMode(FlashMode.off);
-        } catch (e) {
-          // Some cameras and browsers do not expose a flash. Keep the camera
-          // usable even when this optional setting is unsupported.
-          debugPrint('Flash mode unavailable: $e');
-        }
+      if (!mounted) {
+        await _cameraController?.dispose();
+        _cameraController = null;
+        return;
+      }
+
+      setState(() {
+        _isCameraInitialized = true;
+        _cameraFailed = false;
+        _cameraFailureReason = null;
+      });
+      try {
+        await _cameraController!.setFlashMode(FlashMode.off);
+      } catch (e) {
+        // Some cameras and browsers do not expose a flash. Keep the camera
+        // usable even when this optional setting is unsupported.
+        debugPrint('Flash mode unavailable: $e');
       }
     } catch (e) {
       print('Camera init error: $e');
@@ -198,42 +216,44 @@ class _AdvancedVehicleCaptureScreenState
     setState(() {
       _cameraFailed = true;
       _isCameraInitialized = true; // allow UI to render fallback
+      _cameraFailureReason = reason;
     });
   }
 
   // ── Capture ─────────────────────────────────────────────────────────────────
 
   Future<void> _capturePhoto() async {
-    if (_isProcessing) return;
+    if (_isProcessing || _allShotsComplete) return;
 
-    // If camera failed or not ready, fall back to simulated capture
+    // If the camera is unavailable, allow the user to continue from gallery.
+    final controller = _cameraController;
     if (_cameraFailed ||
-        _cameraController == null ||
-        !_cameraController!.value.isInitialized) {
+        controller == null ||
+        !controller.value.isInitialized) {
       await _pickPhotoFromGallery();
       return;
     }
 
-    setState(() => _isProcessing = true);
+    setState(() {
+      _isProcessing = true;
+      _uploadProgress = 0.0;
+    });
     _processingController.forward(from: 0.0);
 
     try {
-      final XFile file = await _cameraController!.takePicture();
-      final Uint8List imageBytes = await file.readAsBytes();
-      final shotType = _requiredShots[_currentShotIndex]['type'] as String;
-      final downloadURL = await _uploadPhotoBytes(imageBytes, shotType);
-      if (!mounted) return;
-      setState(() => _capturedPhotos[shotType] = downloadURL);
-      await _finishPhotoCapture();
+      final image = await controller.takePicture();
+      await _uploadCurrentShot(
+        await image.readAsBytes(),
+        contentType: image.mimeType ?? 'image/jpeg',
+      );
     } catch (e) {
       print('Capture error: $e');
-      if (!mounted) return;
-      setState(() => _isProcessing = false);
-      _showCaptureError(e);
+      _handlePhotoFailure(e);
     }
   }
 
   Future<void> _pickPhotoFromGallery() async {
+    if (_isProcessing || _allShotsComplete) return;
     try {
       final XFile? image = await ImagePicker().pickImage(
         source: ImageSource.gallery,
@@ -243,46 +263,110 @@ class _AdvancedVehicleCaptureScreenState
       );
       if (image == null || !mounted) return;
 
-      setState(() => _isProcessing = true);
+      setState(() {
+        _isProcessing = true;
+        _uploadProgress = 0.0;
+      });
       _processingController.forward(from: 0.0);
-      final bytes = await image.readAsBytes();
-      final shotType = _requiredShots[_currentShotIndex]['type'] as String;
-      final downloadURL = await _uploadPhotoBytes(
-        bytes,
-        shotType,
-        image.mimeType,
+      await _uploadCurrentShot(
+        await image.readAsBytes(),
+        contentType: image.mimeType,
       );
-      if (!mounted) return;
-      setState(() => _capturedPhotos[shotType] = downloadURL);
-      await _finishPhotoCapture();
     } catch (e) {
       print('Photo selection or upload error: $e');
-      if (!mounted) return;
-      setState(() => _isProcessing = false);
-      _showCaptureError(e);
+      _handlePhotoFailure(e);
     }
   }
 
-  Future<String> _uploadPhotoBytes(
-    Uint8List bytes,
-    String shotType, [
+  Future<void> _retryPendingUpload() async {
+    final bytes = _pendingPhotoBytes;
+    if (_isProcessing || bytes == null || _allShotsComplete) return;
+
+    setState(() {
+      _isProcessing = true;
+      _uploadProgress = 0.0;
+    });
+    _processingController.forward(from: 0.0);
+
+    try {
+      await _uploadCurrentShot(
+        bytes,
+        contentType: _pendingPhotoContentType,
+      );
+    } catch (e) {
+      _handlePhotoFailure(e);
+    }
+  }
+
+  void _handlePhotoFailure(Object error) {
+    if (!mounted) return;
+    setState(() => _isProcessing = false);
+    _showCaptureError(error);
+  }
+
+  Future<void> _uploadCurrentShot(
+    Uint8List bytes, {
     String? contentType,
-  ]) async {
+  ) async {
     if (bytes.isEmpty) throw Exception('The selected photo is empty.');
     final user = FirebaseAuth.instance.currentUser;
-    if (user == null)
-      throw Exception('Please sign in before uploading photos.');
+    if (user == null) throw Exception('Please sign in before uploading photos.');
 
-    final extension = contentType?.split('/').last ?? 'jpg';
-    final fileName =
-        '${user.uid}_${shotType}_${DateTime.now().millisecondsSinceEpoch}.$extension';
-    final storageRef = FirebaseStorage.instance.ref().child(
-      'vehicle_photos/$fileName',
+    final shotType = _requiredShots[_currentShotIndex]['type'] as String;
+    _pendingPhotoBytes = bytes;
+    _pendingPhotoContentType = contentType;
+    final extension = switch (contentType?.split('/').last.toLowerCase()) {
+      'png' => 'png',
+      'webp' => 'webp',
+      'gif' => 'gif',
+      'heic' => 'heic',
+      'heif' => 'heif',
+      _ => 'jpg',
+    };
+    _pendingStoragePath ??=
+        'vehicle_photos/${user.uid}_${shotType}_${DateTime.now().millisecondsSinceEpoch}.$extension';
+
+    final downloadUrl = await _uploadPhotoBytes(
+      bytes,
+      contentType: contentType,
+      storagePath: _pendingStoragePath!,
     );
+    if (!mounted) return;
+
+    setState(() {
+      _capturedPhotos[shotType] = downloadUrl;
+      _pendingPhotoBytes = null;
+      _pendingPhotoContentType = null;
+      _pendingStoragePath = null;
+      _uploadProgress = 1.0;
+    });
+    await _finishPhotoCapture();
+  }
+
+  Future<String> _uploadPhotoBytes(
+    Uint8List bytes, {
+    String? contentType,
+    required String storagePath,
+  }) async {
+    if (bytes.isEmpty) throw Exception('The selected photo is empty.');
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) throw Exception('Please sign in before uploading photos.');
+
+    final storageRef = FirebaseStorage.instance.ref().child(storagePath);
     final uploadTask = storageRef.putData(
       bytes,
       SettableMetadata(contentType: contentType ?? 'image/jpeg'),
     );
+    final progressSubscription = uploadTask.snapshotEvents.listen((snapshot) {
+      if (!mounted || snapshot.totalBytes <= 0) return;
+      final double progress = (snapshot.bytesTransferred / snapshot.totalBytes)
+          .clamp(0.0, 1.0)
+          .toDouble();
+      if ((progress - _uploadProgress).abs() >= 0.01 || progress == 1.0) {
+        setState(() => _uploadProgress = progress);
+      }
+    });
+
     try {
       await uploadTask.timeout(const Duration(seconds: 90));
     } on TimeoutException {
@@ -292,6 +376,8 @@ class _AdvancedVehicleCaptureScreenState
       throw TimeoutException(
         'Photo upload timed out. Check your internet connection and try again.',
       );
+    } finally {
+      await progressSubscription.cancel();
     }
     return storageRef
         .getDownloadURL()
@@ -299,48 +385,48 @@ class _AdvancedVehicleCaptureScreenState
   }
 
   Future<void> _finishPhotoCapture() async {
-    await Future.delayed(const Duration(milliseconds: 500));
     if (!mounted) return;
-    setState(() {
-      _isProcessing = false;
-      _captureProgress = (_currentShotIndex + 1) / _requiredShots.length;
-    });
-    Future.delayed(const Duration(milliseconds: 300), _nextShot);
-  }
-
-  void _showCaptureError(Object error) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Photo capture or upload failed: $error'),
-        backgroundColor: Colors.red,
-      ),
+    final nextIndex = _requiredShots.indexWhere(
+      (shot) => !_capturedPhotos.containsKey(shot['type'] as String),
     );
-  }
 
-  void _nextShot() {
-    if (!mounted) return;
-    if (_currentShotIndex < _requiredShots.length - 1) {
+    if (nextIndex < 0) {
       setState(() {
-        _currentShotIndex++;
-        _showGuidance = true;
-      });
-      _updateGuidanceText();
-    } else {
-      setState(() {
-        _allShotsComplete = true;
+        _isProcessing = false;
         _captureProgress = 1.0;
+        _allShotsComplete = true;
       });
-      widget.onPhotosCaptured(_capturedPhotos);
+      widget.onPhotosCaptured(Map<String, String>.from(_capturedPhotos));
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'All ${_capturedPhotos.length} photos captured successfully!',
+            'All ${_requiredShots.length} photos uploaded successfully!',
           ),
           backgroundColor: Colors.green,
           duration: const Duration(seconds: 3),
         ),
       );
+      return;
     }
+
+    setState(() {
+      _isProcessing = false;
+      _captureProgress = _capturedPhotos.length / _requiredShots.length;
+      _currentShotIndex = nextIndex;
+      _showGuidance = true;
+    });
+    _updateGuidanceText();
+  }
+
+  void _showCaptureError(Object error) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Photo capture or upload failed: ${storageErrorMessage(error)}',
+        ),
+        backgroundColor: Colors.red,
+      ),
+    );
   }
 
   void _updateGuidanceText() {
@@ -417,6 +503,22 @@ class _AdvancedVehicleCaptureScreenState
             ),
             textAlign: TextAlign.center,
           ),
+          if (_cameraFailed && _cameraFailureReason != null) ...[
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32),
+              child: Text(
+                _cameraFailureReason!,
+                style: GoogleFonts.poppins(
+                  color: Colors.white54,
+                  fontSize: 11,
+                ),
+                textAlign: TextAlign.center,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
           if (_cameraFailed && kIsWeb) ...[
             const SizedBox(height: 16),
             Container(
@@ -554,7 +656,7 @@ class _AdvancedVehicleCaptureScreenState
             ),
             const SizedBox(height: 20),
             Text(
-              'PROCESSING PHOTO…',
+              _uploadProgress > 0.0 ? 'UPLOADING PHOTO…' : 'PROCESSING PHOTO…',
               style: GoogleFonts.poppins(
                 color: Colors.white,
                 fontSize: 16,
@@ -573,6 +675,23 @@ class _AdvancedVehicleCaptureScreenState
                 fontWeight: FontWeight.w500,
               ),
             ),
+            if (_uploadProgress > 0.0) ...[
+              const SizedBox(height: 16),
+              SizedBox(
+                width: 220,
+                child: LinearProgressIndicator(
+                  value: _uploadProgress,
+                  minHeight: 6,
+                  backgroundColor: Colors.white24,
+                  color: Colors.blueAccent,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '${(_uploadProgress * 100).round()}% uploaded',
+                style: GoogleFonts.poppins(color: Colors.white70, fontSize: 12),
+              ),
+            ],
           ],
         ),
       ),
@@ -851,15 +970,42 @@ class _AdvancedVehicleCaptureScreenState
         if (!_allShotsComplete) ...[
           _buildCaptureButton(),
           const SizedBox(height: 8),
-          TextButton.icon(
-            onPressed: _isProcessing ? null : _pickPhotoFromGallery,
-            icon: const Icon(Icons.photo_library_outlined),
-            label: Text(
-              'Choose from gallery',
-              style: GoogleFonts.poppins(fontWeight: FontWeight.w600),
+          if (_pendingPhotoBytes != null)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                TextButton.icon(
+                  onPressed: _isProcessing ? null : _retryPendingUpload,
+                  icon: const Icon(Icons.cloud_upload_outlined),
+                  label: Text(
+                    'Retry upload',
+                    style: GoogleFonts.poppins(fontWeight: FontWeight.w600),
+                  ),
+                  style: TextButton.styleFrom(
+                    foregroundColor: Colors.orangeAccent,
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: _isProcessing ? null : _pickPhotoFromGallery,
+                  icon: const Icon(Icons.photo_library_outlined),
+                  label: Text(
+                    'Gallery',
+                    style: GoogleFonts.poppins(fontWeight: FontWeight.w600),
+                  ),
+                  style: TextButton.styleFrom(foregroundColor: Colors.white),
+                ),
+              ],
+            )
+          else
+            TextButton.icon(
+              onPressed: _isProcessing ? null : _pickPhotoFromGallery,
+              icon: const Icon(Icons.photo_library_outlined),
+              label: Text(
+                'Choose from gallery',
+                style: GoogleFonts.poppins(fontWeight: FontWeight.w600),
+              ),
+              style: TextButton.styleFrom(foregroundColor: Colors.white),
             ),
-            style: TextButton.styleFrom(foregroundColor: Colors.white),
-          ),
         ],
         if (_allShotsComplete) _buildCompletionButton(),
       ],

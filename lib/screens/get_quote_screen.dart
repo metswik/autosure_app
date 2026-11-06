@@ -450,12 +450,16 @@ class _GetQuoteScreenState extends State<GetQuoteScreen>
         return;
       }
 
-      showModalBottomSheet(
+      final shouldApply = await showModalBottomSheet<bool>(
         context: context,
         isScrollControlled: true,
         backgroundColor: Colors.transparent,
-        builder: (context) => _buildQuoteResults(apiResponse),
+        builder: (sheetContext) =>
+            _buildQuoteResults(apiResponse, sheetContext),
       );
+      if (shouldApply == true && mounted) {
+        _navigateToApplyScreen(apiResponse);
+      }
     } catch (e, stack) {
       print('❌ _showQuoteResults error: $e\n$stack');
       if (!mounted) return;
@@ -465,7 +469,10 @@ class _GetQuoteScreenState extends State<GetQuoteScreen>
   }
 
   // ── Quote results bottom sheet ──────────────────────────────────────────────
-  Widget _buildQuoteResults(Map<String, dynamic> apiResponse) {
+  Widget _buildQuoteResults(
+    Map<String, dynamic> apiResponse,
+    BuildContext sheetContext,
+  ) {
     return Container(
       margin: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -506,7 +513,7 @@ class _GetQuoteScreenState extends State<GetQuoteScreen>
                     color: Colors.transparent,
                     borderRadius: BorderRadius.circular(12),
                     child: InkWell(
-                      onTap: () => Navigator.pop(context),
+                      onTap: () => Navigator.of(sheetContext).pop(false),
                       borderRadius: BorderRadius.circular(12),
                       child: Container(
                         width: 36,
@@ -636,10 +643,27 @@ class _GetQuoteScreenState extends State<GetQuoteScreen>
               Row(
                 children: [
                   Expanded(
-                    child: _buildActionButton(
-                      "Apply Now",
-                      Colors.greenAccent,
-                      () => _navigateToApplyScreen(apiResponse),
+                    child: SizedBox(
+                      height: 48,
+                      child: ElevatedButton(
+                        onPressed: () =>
+                            Navigator.of(sheetContext).pop(true),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                        child: Text(
+                          'Apply Now',
+                          style: GoogleFonts.poppins(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                   const SizedBox(width: 10),

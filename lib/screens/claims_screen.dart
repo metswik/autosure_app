@@ -6,6 +6,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'dart:async';
 import 'dart:typed_data';
+import '../utils/storage_error_message.dart';
 
 class ClaimsScreen extends StatefulWidget {
   const ClaimsScreen({super.key});
@@ -1375,6 +1376,7 @@ class _ClaimsScreenState extends State<ClaimsScreen>
         imageQuality: 85,
       );
 
+      if (!mounted) return;
       if (images.isNotEmpty) {
         setState(() {
           _selectedImages.addAll(images.take(5 - _selectedImages.length));
@@ -1382,6 +1384,7 @@ class _ClaimsScreenState extends State<ClaimsScreen>
         _showSuccessMessage("${images.length} images selected");
       }
     } catch (e) {
+      if (!mounted) return;
       _showErrorDialog("Failed to pick images: $e");
     }
   }
@@ -1400,16 +1403,17 @@ class _ClaimsScreenState extends State<ClaimsScreen>
         imageQuality: 85,
       );
 
-      if (image != null) {
+      if (image != null && mounted) {
         setState(() {
           _selectedImages.add(image);
         });
         _showSuccessMessage("Photo captured successfully!");
       }
     } catch (e) {
+      if (!mounted) return;
       print("Camera error: $e");
       _showErrorDialog(
-        "Camera not available. Please check app permissions or use gallery instead.",
+        "Camera not available. Check app permissions or use the gallery instead.\n\nDetails: $e",
       );
     }
   }
@@ -1493,7 +1497,9 @@ class _ClaimsScreenState extends State<ClaimsScreen>
         print('Successfully uploaded image $i: $downloadUrl');
       } catch (e) {
         print('Error uploading image $i: $e');
-        throw Exception('Failed to upload image $i: $e');
+        throw Exception(
+          'Failed to upload image ${i + 1}: ${storageErrorMessage(e)}',
+        );
       }
     }
 

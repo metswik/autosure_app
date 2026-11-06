@@ -5,6 +5,7 @@ import 'dart:async';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
+import '../utils/storage_error_message.dart';
 import 'home_screen.dart';
 import 'advanced_vehicle_capture.dart';
 
@@ -79,6 +80,15 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
     super.initState();
   }
 
+  @override
+  void dispose() {
+    _idController.dispose();
+    _contactController.dispose();
+    _addressController.dispose();
+    _coverDurationController.dispose();
+    super.dispose();
+  }
+
   // ── File upload ─────────────────────────────────────────────────────────────
 
   Future<void> _uploadFile(String documentType) async {
@@ -127,9 +137,7 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
       }
 
       if (bytes == null || bytes.isEmpty) {
-        _showErrorSnackbar('Could not read file data. Please try again.');
-        setState(() => _uploadingFiles[documentType] = false);
-        return;
+        throw Exception('Could not read file data. Please try again.');
       }
 
       final uid = user.uid;
@@ -179,7 +187,7 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
       );
     } catch (e) {
       print('Firebase upload error: $e');
-      _showErrorSnackbar('Upload failed: $e');
+      _showErrorSnackbar('Upload failed: ${storageErrorMessage(e)}');
       if (mounted) setState(() => _uploadingFiles[documentType] = false);
     }
   }
@@ -257,10 +265,10 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
   }
 
   bool _isFormValid() {
-    return _idController.text.isNotEmpty &&
-        _contactController.text.isNotEmpty &&
-        _addressController.text.isNotEmpty &&
-        _coverDurationController.text.isNotEmpty &&
+    return _idController.text.trim().isNotEmpty &&
+        _contactController.text.trim().isNotEmpty &&
+        _addressController.text.trim().isNotEmpty &&
+        _coverDurationController.text.trim().isNotEmpty &&
         _infoConfirmed &&
         _termsAgreed;
   }
@@ -273,20 +281,33 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
   // ── Submit ───────────────────────────────────────────────────────────────────
 
   Future<void> _submitApplication() async {
-    if (!_isFormValid()) return;
+    if (_isSubmitting) return;
+    if (!_isFormValid()) {
+      _showErrorSnackbar(
+        'Complete your ID number, phone, address, cover duration, and both declarations. Document uploads are optional.',
+      );
+      return;
+    }
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      _showErrorSnackbar('Please log in before submitting an application.');
+      return;
+    }
+
     setState(() => _isSubmitting = true);
 
     try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user == null) throw Exception('Please log in');
-
       final applicationId = _applicationsRef.push().key;
+      if (applicationId == null) {
+        throw StateError('Could not create an application ID. Please retry.');
+      }
 
       final Map<String, dynamic> applicationData = {
         'personalInfo': {
-          'idNumber': _idController.text,
-          'contactNumber': _contactController.text,
-          'address': _addressController.text,
+          'idNumber': _idController.text.trim(),
+          'contactNumber': _contactController.text.trim(),
+          'address': _addressController.text.trim(),
           'coverDuration': _coverDurationController.text,
         },
         // Boolean flags (for quick status checks)
@@ -308,7 +329,10 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
         applicationData['quoteData'] = quoteData;
       }
 
-      await _applicationsRef.child(applicationId!).set(applicationData);
+      await _applicationsRef
+          .child(applicationId)
+          .set(applicationData)
+          .timeout(const Duration(seconds: 30));
 
       _showSuccessSnackbar('🎉 Application submitted successfully!');
 
@@ -323,8 +347,17 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
           (route) => false,
         );
       }
+    } on TimeoutException {
+      _showErrorSnackbar(
+        'Submission timed out. Check your connection and try again.',
+      );
     } catch (e) {
-      _showErrorSnackbar('Submission failed: ${e.toString()}');
+      final details = e.toString();
+      final message = details.toLowerCase().contains('permission_denied') ||
+              details.toLowerCase().contains('permission-denied')
+          ? 'Firebase denied the application save. Check Realtime Database Rules for signed-in users. Details: $details'
+          : 'Submission failed: $details';
+      _showErrorSnackbar(message);
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }
@@ -812,6 +845,9 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
                 child: TextField(
                   controller: controller,
                   style: GoogleFonts.poppins(color: Colors.white, fontSize: 14),
+                  onChanged: (_) {
+                    if (mounted) setState(() {});
+                  },
                   decoration: InputDecoration(
                     hintText: hint,
                     hintStyle: GoogleFonts.poppins(
@@ -885,8 +921,11 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
                         ),
                       )
                       .toList(),
-                  onChanged: (v) =>
-                      setState(() => _coverDurationController.text = v!),
+                  onChanged: (v) {
+                    if (v != null) {
+                      setState(() => _coverDurationController.text = v);
+                    }
+                  },
                   dropdownColor: const Color.fromARGB(255, 16, 52, 90),
                   style: GoogleFonts.poppins(color: Colors.white),
                   decoration: InputDecoration(
@@ -1397,7 +1436,7 @@ class _ApplyInsuranceScreenState extends State<ApplyInsuranceScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Fill in all required fields and agree to declarations to submit',
+                    'Required: ID number, phone, address, cover duration, and both declarations. Document uploads are optional.',
                     style: GoogleFonts.poppins(
                       color: Colors.orangeAccent,
                       fontSize: 12,

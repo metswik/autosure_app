@@ -48,6 +48,7 @@ class DefaultFirebaseOptions {
     appId: "1:46543186421:android:5c78fa9683f2d8e2b018bc",
     messagingSenderId: "46543186421",
     projectId: "autosure-66414",
+    databaseURL: "https://autosure-66414-default-rtdb.firebaseio.com",
     storageBucket: "autosure-66414.firebasestorage.app",
   );
 }
