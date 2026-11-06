@@ -1,4 +1,4 @@
-\# 🚗 AutoSure – Car Insurance Mobile Application - Kabo
+\# 🚗 AutoSure – Car Insurance Mobile Application
 
 
 
